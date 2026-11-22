@@ -239,7 +239,7 @@ class SubtitleService : Service() {
 
     private fun callGeminiTranslate(apiKey: String, langName: String, wavBytes: ByteArray): String {
         return try {
-            val url = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey")
+            val url = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=$apiKey")
             val conn = url.openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.setRequestProperty("Content-Type", "application/json")

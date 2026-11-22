@@ -238,38 +238,36 @@ class SubtitleService : Service() {
         val buffer = ShortArray(2048)
         audioRecord?.startRecording()
 
-        while (isRunning) {
+            while (isRunning) {
             val read = audioRecord?.read(buffer, 0, buffer.size) ?: 0
             if (read > 0) {
                 val isFinal = recognizer.acceptWaveForm(buffer, read)
-                val jsonStr = if (isFinal) recognizer.result else recognizer.partialResult
-                val key = if (isFinal) "text" else "partial"
-                val spokenText = JSONObject(jsonStr).optString(key, "").trim()
-
-                if (spokenText.isNotEmpty() && spokenText != lastTranslatedText) {
-                    lastTranslatedText = spokenText
-                    translator?.translate(spokenText)?.addOnSuccessListener { thaiText ->
-                        updateOverlay(thaiText, spokenText)
+                if (isFinal) {
+                    val rawText = JSONObject(recognizer.result).optString("text", "").trim()
+                    val cleanText = if (rawText.any { it in '\u3040'..'\u9FFF' }) {
+                        rawText.replace(" ", "")
+                    } else {
+                        rawText
+                    }
+                    if (cleanText.isNotEmpty() && cleanText != lastTranslatedText) {
+                        lastTranslatedText = cleanText
+                        translator?.translate(cleanText)?.addOnSuccessListener { thaiText ->
+                            updateOverlay(thaiText, cleanText)
+                        }
+                    }
+                } else {
+                    val partial = JSONObject(recognizer.partialResult).optString("partial", "").trim()
+                    if (partial.isNotEmpty()) {
+                        val cleanPartial = if (partial.any { it in '\u3040'..'\u9FFF' }) {
+                            partial.replace(" ", "")
+                        } else {
+                            partial
+                        }
+                        CoroutineScope(Dispatchers.Main).launch {
+                            tvOriginal?.text = cleanPartial
+                        }
                     }
                 }
             }
-        }
-        recognizer.close()
-    }
-
-    override fun onDestroy() {
-        isRunning = false
-        serviceScope.cancel()
-        audioRecord?.stop()
-        audioRecord?.release()
-        mediaProjection?.stop()
-        translator?.close()
-        voskModel?.close()
-        if (overlayView != null) {
-            windowManager?.removeView(overlayView)
-            overlayView = null
-        }
-        super.onDestroy()
-    }
-}
-
+            }
+            

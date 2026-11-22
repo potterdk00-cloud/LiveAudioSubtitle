@@ -11,25 +11,20 @@ import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.IBinder
+import android.util.Base64
 import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.View
 import android.view.WindowManager
 import android.widget.TextView
 import androidx.core.app.NotificationCompat
-import com.google.mlkit.common.model.DownloadConditions
-import com.google.mlkit.nl.translate.TranslateLanguage
-import com.google.mlkit.nl.translate.Translation
-import com.google.mlkit.nl.translate.Translator
-import com.google.mlkit.nl.translate.TranslatorOptions
 import kotlinx.coroutines.*
+import org.json.JSONArray
 import org.json.JSONObject
-import org.vosk.Model
-import org.vosk.Recognizer
-import java.io.File
-import java.io.FileOutputStream
+import java.io.ByteArrayOutputStream
+import java.net.HttpURLConnection
 import java.net.URL
-import java.util.zip.ZipInputStream
+import kotlin.math.abs
 
 class SubtitleService : Service() {
 
@@ -40,17 +35,15 @@ class SubtitleService : Service() {
 
     private var mediaProjection: MediaProjection? = null
     private var audioRecord: AudioRecord? = null
-    private var translator: Translator? = null
-    private var voskModel: Model? = null
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var isRunning = false
-    private var lastTranslatedText = ""
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val langCode = intent?.getStringExtra("LANG_CODE") ?: "en"
+        val apiKey = intent?.getStringExtra("API_KEY") ?: ""
+        val langName = intent?.getStringExtra("LANG_NAME") ?: "any language"
         val isInternal = intent?.getBooleanExtra("IS_INTERNAL", false) ?: false
         val resultCode = intent?.getIntExtra("RESULT_CODE", Activity.RESULT_CANCELED) ?: Activity.RESULT_CANCELED
         val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -66,15 +59,8 @@ class SubtitleService : Service() {
         isRunning = true
         serviceScope.launch {
             try {
-                updateOverlay("กำลังเตรียมตัวแปลภาษาไทย...", "")
-                setupTranslator(langCode)
-
-                updateOverlay("กำลังโหลดโมเดลเสียง ($langCode) ครั้งแรกอาจใช้เวลา 1-2 นาที...", "")
-                val modelDir = prepareVoskModel(langCode)
-                voskModel = Model(modelDir.absolutePath)
-
-                updateOverlay("พร้อมแล้ว! กำลังรอเสียงพูด...", "")
-                startAudioCapture(isInternal, resultCode, data)
+                updateOverlay("พร้อมแล้ว! กำลังฟังเสียง ($langName)...", "")
+                startAudioCapture(apiKey, langName, isInternal, resultCode, data)
             } catch (e: Exception) {
                 updateOverlay("เกิดข้อผิดพลาด: ${e.message}", "")
             }
@@ -90,7 +76,7 @@ class SubtitleService : Service() {
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
         val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("ซับไทยเรียลไทม์กำลังทำงาน")
+            .setContentTitle("ซับไทย AI กำลังทำงาน")
             .setContentText("กำลังฟังเสียงและแปลเป็นภาษาไทย")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .build()
@@ -129,74 +115,15 @@ class SubtitleService : Service() {
         windowManager?.addView(overlayView, params)
     }
 
-    private fun updateOverlay(thai: String, original: String) {
+    private fun updateOverlay(thai: String, sub: String) {
         CoroutineScope(Dispatchers.Main).launch {
             tvThai?.text = thai
-            tvOriginal?.text = original
+            tvOriginal?.text = sub
         }
-    }
-
-    private suspend fun setupTranslator(langCode: String) {
-        val sourceLang = when (langCode) {
-            "ja" -> TranslateLanguage.JAPANESE
-            "zh" -> TranslateLanguage.CHINESE
-            "ko" -> TranslateLanguage.KOREAN
-            else -> TranslateLanguage.ENGLISH
-        }
-        val options = TranslatorOptions.Builder()
-            .setSourceLanguage(sourceLang)
-            .setTargetLanguage(TranslateLanguage.THAI)
-            .build()
-        translator = Translation.getClient(options)
-
-        val deferred = CompletableDeferred<Unit>()
-        translator?.downloadModelIfNeeded(DownloadConditions.Builder().build())
-            ?.addOnSuccessListener { deferred.complete(Unit) }
-            ?.addOnFailureListener { deferred.completeExceptionally(it) }
-        deferred.await()
-    }
-
-    private fun prepareVoskModel(langCode: String): File {
-        val modelUrls = mapOf(
-            "en" to "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip",
-            "ja" to "https://alphacephei.com/vosk/models/vosk-model-small-ja-0.22.zip",
-            "zh" to "https://alphacephei.com/vosk/models/vosk-model-small-cn-0.22.zip",
-            "ko" to "https://alphacephei.com/vosk/models/vosk-model-small-ko-0.22.zip"
-        )
-        val urlStr = modelUrls[langCode] ?: modelUrls["en"]!!
-        val targetDir = File(filesDir, "vosk_model_$langCode")
-
-        if (targetDir.exists() && targetDir.listFiles()?.isNotEmpty() == true) {
-            return targetDir.listFiles()!!.first { it.isDirectory }
-        }
-
-        targetDir.mkdirs()
-        val zipFile = File(cacheDir, "model_$langCode.zip")
-        URL(urlStr).openStream().use { input ->
-            FileOutputStream(zipFile).use { output ->
-                input.copyTo(output)
-            }
-        }
-
-        ZipInputStream(zipFile.inputStream()).use { zis ->
-            var entry = zis.nextEntry
-            while (entry != null) {
-                val outFile = File(targetDir, entry.name)
-                if (entry.isDirectory) {
-                    outFile.mkdirs()
-                } else {
-                    outFile.parentFile?.mkdirs()
-                    FileOutputStream(outFile).use { fos -> zis.copyTo(fos) }
-                }
-                entry = zis.nextEntry
-            }
-        }
-        zipFile.delete()
-        return targetDir.listFiles()!!.first { it.isDirectory }
     }
 
     @SuppressLint("MissingPermission")
-    private fun startAudioCapture(isInternal: Boolean, resultCode: Int, data: Intent?) {
+    private fun startAudioCapture(apiKey: String, langName: String, isInternal: Boolean, resultCode: Int, data: Intent?) {
         val sampleRate = 16000
         val bufferSize = AudioRecord.getMinBufferSize(
             sampleRate,
@@ -234,43 +161,127 @@ class SubtitleService : Service() {
             )
         }
 
-        val recognizer = Recognizer(voskModel, sampleRate.toFloat())
-        val buffer = ShortArray(2048)
+        val chunkSamples = sampleRate * 4 // อัดเสียงทีละ 4 วินาที
+        val readBuffer = ShortArray(2048)
+        val pcmBuffer = ShortArray(chunkSamples)
+        var offset = 0
+
         audioRecord?.startRecording()
 
         while (isRunning) {
-            val read = audioRecord?.read(buffer, 0, buffer.size) ?: 0
+            val read = audioRecord?.read(readBuffer, 0, readBuffer.size) ?: 0
             if (read > 0) {
-                val isFinal = recognizer.acceptWaveForm(buffer, read)
-                if (isFinal) {
-                    val rawText = JSONObject(recognizer.result).optString("text", "").trim()
-                    val cleanText = if (rawText.any { it in '\u3040'..'\u9FFF' }) {
-                        rawText.replace(" ", "")
-                    } else {
-                        rawText
+                val copyLen = minOf(read, chunkSamples - offset)
+                System.arraycopy(readBuffer, 0, pcmBuffer, offset, copyLen)
+                offset += copyLen
+
+                if (offset >= chunkSamples) {
+                    val audioCopy = pcmBuffer.copyOf()
+                    offset = 0
+
+                    // เช็กความดังเสียง ถ้าเงียบสนิทจะข้ามไปไม่เปลืองโควตา API
+                    var maxAmp = 0
+                    for (s in audioCopy) {
+                        val a = abs(s.toInt())
+                        if (a > maxAmp) maxAmp = a
                     }
-                    if (cleanText.isNotEmpty() && cleanText != lastTranslatedText) {
-                        lastTranslatedText = cleanText
-                        translator?.translate(cleanText)?.addOnSuccessListener { thaiText ->
-                            updateOverlay(thaiText, cleanText)
-                        }
-                    }
-                } else {
-                    val partial = JSONObject(recognizer.partialResult).optString("partial", "").trim()
-                    if (partial.isNotEmpty()) {
-                        val cleanPartial = if (partial.any { it in '\u3040'..'\u9FFF' }) {
-                            partial.replace(" ", "")
-                        } else {
-                            partial
-                        }
-                        CoroutineScope(Dispatchers.Main).launch {
-                            tvOriginal?.text = cleanPartial
+
+                    if (maxAmp > 400) {
+                        serviceScope.launch {
+                            val wavBytes = pcmToWav(audioCopy, sampleRate)
+                            val result = callGeminiTranslate(apiKey, langName, wavBytes)
+                            if (result.isNotBlank() && result != "-") {
+                                updateOverlay(result, "")
+                            }
                         }
                     }
                 }
             }
         }
-        recognizer.close()
+    }
+
+    private fun pcmToWav(pcm: ShortArray, sampleRate: Int): ByteArray {
+        val dataSize = pcm.size * 2
+        val out = ByteArrayOutputStream(44 + dataSize)
+        val byteRate = sampleRate * 2
+
+        fun writeString(s: String) = out.write(s.toByteArray())
+        fun writeInt(v: Int) {
+            out.write(v and 0xff)
+            out.write((v shr 8) and 0xff)
+            out.write((v shr 16) and 0xff)
+            out.write((v shr 24) and 0xff)
+        }
+        fun writeShort(v: Int) {
+            out.write(v and 0xff)
+            out.write((v shr 8) and 0xff)
+        }
+
+        writeString("RIFF")
+        writeInt(36 + dataSize)
+        writeString("WAVE")
+        writeString("fmt ")
+        writeInt(16)
+        writeShort(1)
+        writeShort(1)
+        writeInt(sampleRate)
+        writeInt(byteRate)
+        writeShort(2)
+        writeShort(16)
+        writeString("data")
+        writeInt(dataSize)
+
+        for (s in pcm) {
+            writeShort(s.toInt())
+        }
+        return out.toByteArray()
+    }
+
+    private fun callGeminiTranslate(apiKey: String, langName: String, wavBytes: ByteArray): String {
+        return try {
+            val url = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey")
+            val conn = url.openConnection() as HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.doOutput = true
+            conn.connectTimeout = 10000
+            conn.readTimeout = 15000
+
+            val base64Audio = Base64.encodeToString(wavBytes, Base64.NO_WRAP)
+            val prompt = "Listen to the spoken dialogue in $langName from this audio. Ignore background music or noise. Translate the speech into natural Thai subtitles. Output ONLY the Thai translation. If there is no clear speech, output only a single dash: -"
+
+            val inlineData = JSONObject().apply {
+                put("mime_type", "audio/wav")
+                put("data", base64Audio)
+            }
+            val parts = JSONArray().apply {
+                put(JSONObject().put("text", prompt))
+                put(JSONObject().put("inline_data", inlineData))
+            }
+            val body = JSONObject().apply {
+                put("contents", JSONArray().put(JSONObject().put("parts", parts)))
+            }
+
+            conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+
+            val responseCode = conn.responseCode
+            val stream = if (responseCode in 200..299) conn.inputStream else conn.errorStream
+            val responseText = stream.bufferedReader().use { it.readText() }
+
+            if (responseCode in 200..299) {
+                val json = JSONObject(responseText)
+                val candidates = json.optJSONArray("candidates")
+                if (candidates != null && candidates.length() > 0) {
+                    val content = candidates.getJSONObject(0).getJSONObject("content")
+                    val respParts = content.getJSONArray("parts")
+                    respParts.getJSONObject(0).optString("text", "").trim()
+                } else ""
+            } else {
+                "API Error ($responseCode)"
+            }
+        } catch (e: Exception) {
+            "เชื่อมต่อไม่ได้: ${e.message}"
+        }
     }
 
     override fun onDestroy() {
@@ -279,8 +290,6 @@ class SubtitleService : Service() {
         audioRecord?.stop()
         audioRecord?.release()
         mediaProjection?.stop()
-        translator?.close()
-        voskModel?.close()
         if (overlayView != null) {
             windowManager?.removeView(overlayView)
             overlayView = null

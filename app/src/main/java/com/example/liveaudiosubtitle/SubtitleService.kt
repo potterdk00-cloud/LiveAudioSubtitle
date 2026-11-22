@@ -161,7 +161,7 @@ class SubtitleService : Service() {
             )
         }
 
-        val chunkSamples = sampleRate * 4 // อัดเสียงทีละ 4 วินาที
+        val chunkSamples = sampleRate * 8 // อัดเสียงทีละ 4 วินาที
         val readBuffer = ShortArray(2048)
         val pcmBuffer = ShortArray(chunkSamples)
         var offset = 0
